@@ -1,0 +1,849 @@
+@page "/documenteditor"
+@using Microsoft.JSInterop
+@using Microsoft.AspNetCore.Components.Forms
+@using System.Text.Json
+@inject IJSRuntime JSRuntime
+@inject HttpClient Http
+
+<div class="de-wrapper">
+
+    <!-- ══ Top bar ═══════════════════════════════════════════════════════════ -->
+    <div class="de-topbar">
+        <span class="de-brand">📄 Deditor</span>
+        <div class="de-actions">
+            <InputFile id="fileUploadInput" OnChange="HandleFileUpload"
+                       accept=".docx,.doc,.rtf,.txt" style="display:none" />
+            <button class="de-btn de-btn-primary"
+                    onclick="document.getElementById('fileUploadInput').click()">
+                 Open File
+            </button>
+            <button class="de-btn de-btn-secondary" @onclick="SaveDocument">
+                 Save as DOCX
+            </button>
+             <button class="de-btn de-btn-secondary" @onclick="ToggleTrackChanges">
+         Track Changes
+    </button>
+    <button class="de-btn de-btn-secondary" @onclick="AcceptAllChanges">
+        ✔ Accept All
+    </button>
+    <button class="de-btn de-btn-secondary" @onclick="RejectAllChanges">
+        ✖ Reject All
+    </button>
+        </div>
+        @if (!string.IsNullOrEmpty(_statusMessage))
+        {
+            <span class="de-status @_statusClass">@_statusMessage</span>
+        }
+        <!-- AI Chat toggle -->
+        <button class="de-btn de-btn-chat @(_chatOpen ? "active" : "")"
+                @onclick="ToggleChat" title="Toggle AI Assistant">
+             AI Assistant
+        </button>
+    </div>
+
+    <!-- ══ Tab bar ══════════════════════════════════════════════════════════ -->
+    <div class="de-tabbar">
+        @foreach (var tab in _tabs)
+        {
+            <div class="de-tab @(tab.Id == _activeTabId ? "active" : "")"
+                 @onclick="() => SwitchTab(tab.Id)"
+                 title="@tab.FileName">
+                <span class="de-tab-name">@tab.DisplayName</span>
+                @if (tab.IsModified)
+                {
+                    <span class="de-tab-dot" title="Unsaved changes">●</span>
+                }
+                <button class="de-tab-close"
+                        @onclick="() => CloseTab(tab.Id)"
+                        @onclick:stopPropagation="true"
+                        title="Close">✕</button>
+            </div>
+        }
+        <button class="de-tab-new" @onclick="NewTab" title="New empty document">＋</button>
+    </div>
+
+    <!-- ══ Case toolbar ══════════════════════════════════════════════════════ -->
+    <div class="de-casetoolbar">
+        <span class="de-caselabel">Aa</span>
+        <div class="de-casegroup">
+            <button class="de-casebtn" @onclick="ApplyTitleCase"
+                    title="Title Case: Capitalizes major words, keeps minor words lowercase">
+                <span class="de-casebtn-icon">Tt</span>Title Case
+            </button>
+            <button class="de-casebtn" @onclick="ApplyInitialCaps"
+                    title="Initial Caps: Capitalizes the first letter of every word">
+                <span class="de-casebtn-icon">Aa</span>Initial Caps
+            </button>
+            <button class="de-casebtn de-casebtn-ai" @onclick="ApplyEssentialCaps"
+                    title="Essential Caps: NLP detects and capitalizes nouns and technical terms">
+                <span class="de-casebtn-icon">✦</span>Essential Caps
+            </button>
+        </div>
+
+        <!-- ── Search bar ── -->
+        <div class="de-searchbar">
+            <input class="de-search-input"
+                   id="searchInput"
+                   type="text"
+                   placeholder="🔍 Search…"
+                   value="@_searchQuery"
+                   @oninput="OnSearchInput"
+                   @onkeydown="HandleSearchKeyDown" />
+            <span class="de-search-count">@_searchResultInfo</span>
+            <button class="de-search-nav" @onclick="SearchPrev" title="Previous match (Shift+Enter)">‹</button>
+            <button class="de-search-nav" @onclick="SearchNext" title="Next match (Enter)">›</button>
+            <button class="de-search-nav de-search-replace-toggle"
+                    @onclick="ToggleReplace" title="Toggle replace">⇄</button>
+            <button class="de-search-clear" @onclick="ClearSearch" title="Clear search">✕</button>
+        </div>
+
+        @if (_showReplace)
+        {
+            <div class="de-replacebar">
+                <input class="de-search-input"
+                       type="text"
+                       placeholder="Replace with…"
+                       @bind="_replaceQuery"
+                       @bind:event="oninput" />
+                <button class="de-casebtn" @onclick="ReplaceAll">Replace All</button>
+            </div>
+        }
+    </div>
+
+    <!-- ══ Main area: Editor + Chat sidebar ══════════════════════════════════ -->
+    <div class="de-main">
+
+        <!-- Document Editor -->
+        <div class="de-editor-area">
+            <div id="container1"></div>
+        </div>
+
+        <!-- AI Chat Sidebar -->
+        @if (_chatOpen)
+        {
+            <div class="de-chat-sidebar">
+
+                <!-- Sidebar header -->
+                <div class="de-chat-header">
+                    <span class="de-chat-title">🤖 AI Assistant</span>
+                    <button class="de-chat-close" @onclick="ToggleChat">✕</button>
+                </div>
+
+                <!-- Quick action buttons -->
+                <div class="de-chat-actions">
+                    <button class="de-chat-action-btn" @onclick='() => QuickAction("proofread")'
+                            disabled="@_chatLoading" title="Select text first">
+                        🔍 Proofread Selection
+                    </button>
+                    <button class="de-chat-action-btn" @onclick='() => QuickAction("copyedit")'
+                            disabled="@_chatLoading" title="Select text first">
+                        ✏️ Copyedit Selection
+                    </button>
+                </div>
+
+                <!-- Message history -->
+                <div class="de-chat-messages" id="chatMessages">
+                    @if (_chatMessages.Count == 0)
+                    {
+                        <div class="de-chat-empty">
+                            <p>👋 Hi! I'm your AI copyediting assistant.</p>
+                            <p>Select text in the document and click <strong>Proofread</strong> or <strong>Copyedit</strong>, or ask me anything about your document.</p>
+                        </div>
+                    }
+                    @foreach (var msg in _chatMessages)
+                    {
+                        <div class="de-chat-msg de-chat-msg-@msg.Role">
+                            <div class="de-chat-msg-label">@(msg.Role == "user" ? "You" : "AI")</div>
+                            <div class="de-chat-msg-body">@((MarkupString)msg.HtmlContent)</div>
+                           @if (msg.Role == "assistant" && !string.IsNullOrEmpty(msg.ApplicableText))
+{
+    if (msg.HtmlContent.Contains("Original:"))
+    {
+        <button class="de-chat-apply-btn"
+                @onclick="() => ApplySuggestion(msg.ApplicableText!)">
+            ↩ Apply to document
+        </button>
+    }
+    else
+    {
+        <button class="de-chat-apply-btn"
+                @onclick="() => PreviewSuggestion(msg)">
+            👁 Preview
+        </button>
+    }
+}
+                        </div>
+                    }
+                    @if (_chatLoading)
+                    {
+                        <div class="de-chat-msg de-chat-msg-assistant">
+                            <div class="de-chat-msg-label">AI</div>
+                            <div class="de-chat-msg-body de-chat-typing">
+                                <span></span><span></span><span></span>
+                            </div>
+                        </div>
+                    }
+                </div>
+
+                <!-- Input row -->
+                <div class="de-chat-input-row">
+                    <textarea class="de-chat-input"
+                              placeholder="Ask about your document…"
+                              @bind="_chatInput"
+                              @bind:event="oninput"
+                              @onkeydown="HandleChatKeyDown"
+                              rows="2"
+                              disabled="@_chatLoading"></textarea>
+                    <button class="de-chat-send" @onclick="SendChatMessage"
+                            disabled="@(_chatLoading || string.IsNullOrWhiteSpace(_chatInput))">
+                        ➤
+                    </button>
+                </div>
+
+            </div>
+        }
+
+    </div><!-- /de-main -->
+
+</div><!-- /de-wrapper -->
+
+@code {
+    // ── State ────────────────────────────────────────────────────────────────
+    private string _statusMessage = string.Empty;
+    private string _statusClass   = string.Empty;
+
+    // Tab state
+    private List<DocTab> _tabs      = new();
+    private Guid         _activeTabId = Guid.Empty;
+    private DocTab?      ActiveTab  => _tabs.FirstOrDefault(t => t.Id == _activeTabId);
+    private string?      _currentFileName => ActiveTab?.FileName;
+
+    // Search state
+    private string _searchQuery      = string.Empty;
+    private string _replaceQuery     = string.Empty;
+    private string _searchResultInfo = string.Empty;
+    private bool   _showReplace      = false;
+
+    // Chat state
+    private bool   _chatOpen    = false;
+    private bool   _chatLoading = false;
+    private string _chatInput   = string.Empty;
+    private List<ChatMessage> _chatMessages = new();
+
+    // ── Lifecycle ────────────────────────────────────────────────────────────
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+            await JSRuntime.InvokeVoidAsync("initializeDocumentEditor");
+    }
+
+    // ── File Upload ──────────────────────────────────────────────────────────
+    private async Task HandleFileUpload(InputFileChangeEventArgs e)
+    {
+        var file = e.File;
+        if (file == null) return;
+
+        var ext = Path.GetExtension(file.Name).ToLowerInvariant();
+        if (ext is not (".docx" or ".doc" or ".rtf" or ".txt"))
+        {
+            SetStatus("❌ Unsupported file type.", isError: true);
+            return;
+        }
+
+        SetStatus("⏳ Opening document…", isError: false);
+        try
+        {
+            using var formContent = new MultipartFormDataContent();
+            var stream = file.OpenReadStream(maxAllowedSize: 104_857_600);
+            formContent.Add(new StreamContent(stream), "files", file.Name);
+
+            var response = await Http.PostAsync("api/documenteditor/import", formContent);
+            if (!response.IsSuccessStatusCode)
+            {
+                SetStatus($"❌ {await response.Content.ReadAsStringAsync()}", isError: true);
+                return;
+            }
+
+            var sfdt = await response.Content.ReadAsStringAsync();
+            var fileName = Path.GetFileNameWithoutExtension(file.Name) + ".docx";
+
+            // Find or create the target tab BEFORE any async JS call
+            var activeTab = ActiveTab;
+            DocTab targetTab;
+            if (activeTab != null && activeTab.IsEmpty)
+            {
+                targetTab = activeTab; // reuse current empty tab
+            }
+            else
+            {
+                targetTab = new DocTab { FileName = "loading", IsEmpty = false };
+                _tabs.Add(targetTab);
+                _activeTabId = targetTab.Id;
+            }
+
+            // Store SFDT in tab object
+            targetTab.FileName   = fileName;
+            targetTab.Sfdt       = sfdt;
+            targetTab.IsModified = false;
+            targetTab.IsEmpty    = false;
+
+            // Debug: verify tab was updated
+            await JSRuntime.InvokeVoidAsync("eval",
+                $"console.log('[HandleFileUpload] targetTab.Id={targetTab.Id}, IsEmpty={targetTab.IsEmpty}, Sfdt.Length={targetTab.Sfdt?.Length ?? 0}, _tabs.Count={_tabs.Count}')");
+
+            // Load into editor
+            await JSRuntime.InvokeVoidAsync("loadDocument", sfdt);
+            SetStatus($"✅ Opened: {file.Name}", isError: false);
+            StateHasChanged();
+        }
+        catch (Exception ex) { SetStatus($"❌ {ex.Message}", isError: true); }
+    }
+
+    // ── Save ─────────────────────────────────────────────────────────────────
+    private async Task SaveDocument()
+    {
+        if (ActiveTab == null || ActiveTab.IsEmpty)
+        {
+            SetStatus("❌ No document to save.", isError: true);
+            return;
+        }
+        SetStatus("⏳ Saving…", isError: false);
+        try
+        {
+            var sfdt = await JSRuntime.InvokeAsync<string>("getDocumentContent");
+            if (string.IsNullOrEmpty(sfdt)) { SetStatus("❌ Nothing to save.", isError: true); return; }
+
+            // Update stored SFDT and mark as saved
+            ActiveTab.Sfdt       = sfdt;
+            ActiveTab.IsModified = false;
+
+            var response = await Http.PostAsJsonAsync("api/documenteditor/save",
+                new { Content = sfdt, FileName = ActiveTab.FileName });
+            if (!response.IsSuccessStatusCode) { SetStatus("❌ Save failed.", isError: true); return; }
+
+            var base64 = Convert.ToBase64String(await response.Content.ReadAsByteArrayAsync());
+            await JSRuntime.InvokeVoidAsync("downloadFile", base64, ActiveTab.FileName);
+            SetStatus($"✅ Saved: {ActiveTab.FileName}", isError: false);
+            StateHasChanged();
+        }
+        catch (Exception ex) { SetStatus($"❌ {ex.Message}", isError: true); }
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // CASE TRANSFORMATIONS
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private async Task ApplyTitleCase()
+    {
+        var result = await JSRuntime.InvokeAsync<string>("applyTitleCase");
+        SetStatus(result == "NO_SELECTION" ? "⚠️ Select text first." : "✅ Title Case applied.",
+                  result == "NO_SELECTION");
+    }
+
+    private async Task ApplyInitialCaps()
+    {
+        var result = await JSRuntime.InvokeAsync<string>("applyInitialCaps");
+        SetStatus(result == "NO_SELECTION" ? "⚠️ Select text first." : "✅ Initial Caps applied.",
+                  result == "NO_SELECTION");
+    }
+
+    private async Task ApplyEssentialCaps()
+    {
+        var result = await JSRuntime.InvokeAsync<string>("applyEssentialCaps");
+        if      (result == "NO_SELECTION")   SetStatus("⚠️ Select text first.", true);
+        else if (result == "NLP_NOT_LOADED") SetStatus("❌ NLP not loaded yet — retry.", true);
+        else                                 SetStatus("✅ Essential Caps applied.", false);
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════
+    // AI CHAT
+    // ══════════════════════════════════════════════════════════════════════════
+
+    private void ToggleChat()
+    {
+        _chatOpen = !_chatOpen;
+        StateHasChanged();
+        // Resize editor now that sidebar is shown/hidden
+        JSRuntime.InvokeVoidAsync("resizeEditor");
+    }
+
+    // ── Quick action buttons (Proofread / Copyedit) ──────────────────────────
+    private async Task QuickAction(string action)
+    {
+        // Use selected text; if nothing selected, fall back to full document
+        var selected = await JSRuntime.InvokeAsync<string>("getSelectedText");
+        bool isWholeDoc = false;
+
+        if (string.IsNullOrWhiteSpace(selected))
+        {
+            selected = await JSRuntime.InvokeAsync<string>("getDocumentText");
+            isWholeDoc = true;
+        }
+
+        if (string.IsNullOrWhiteSpace(selected))
+        {
+            AddMessage("assistant", "⚠️ The document appears to be empty.", null);
+            return;
+        }
+
+        // Trim to ~3000 words to stay within Groq free token limits
+        // (~3000 words ≈ 4000 tokens, leaving room for system prompt + response)
+        var trimmed = TrimToWordLimit(selected, 3000);
+        bool wasTrimmed = trimmed.Length < selected.Length;
+
+        var scope = isWholeDoc ? "whole document" : "selection";
+        var label  = isWholeDoc ? "📄 Whole document" : $"<em>{Truncate(selected, 80)}</em>";
+
+        if (wasTrimmed)
+            AddMessage("assistant",
+                $"⚠️ Document is large — analyzing first ~3,000 words to stay within free token limits.",
+                null);
+
+        var prompt = action == "proofread"
+            ? $"Proofread the following {scope}. List each issue with a short explanation and corrected version. If no issues, say so.\n\nText:\n{trimmed}"
+            : $"Copyedit the following {scope} to improve clarity, flow, and word choice while preserving meaning. Show the improved version (labeled 'Improved version:') then briefly explain your changes.\n\nText:\n{trimmed}";
+
+        AddMessage("user", action == "proofread"
+            ? $"🔍 Proofread: {label}"
+            : $"✏️ Copyedit: {label}", null);
+
+        await CallAI(prompt, extractApplicable: action == "copyedit");
+    }
+
+    // ── Free-form chat ───────────────────────────────────────────────────────
+    private async Task SendChatMessage()
+    {
+        if (string.IsNullOrWhiteSpace(_chatInput) || _chatLoading) return;
+
+        var userText = _chatInput.Trim();
+        _chatInput = string.Empty;
+        AddMessage("user", System.Web.HttpUtility.HtmlEncode(userText), null);
+
+        // Determine if free (simple) or AI (complex)
+        if (IsSimpleCheck(userText))
+        {
+            await RunFreeCheck(userText);
+        }
+        else
+        {
+            // Include selected text context if any
+            var selected = await JSRuntime.InvokeAsync<string>("getSelectedText");
+            var prompt = string.IsNullOrWhiteSpace(selected)
+                ? userText
+                : $"{userText}\n\nSelected text for context:\n{selected}";
+            await CallAI(prompt, extractApplicable: false);
+        }
+    }
+
+    private async Task HandleChatKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter" && !e.ShiftKey)
+            await SendChatMessage();
+    }
+
+    // ── Determines if a query is simple enough to handle free ────────────────
+    private static bool IsSimpleCheck(string input)
+    {
+        var lower = input.ToLower();
+        return lower.Contains("word count") || lower.Contains("how many words") ||
+               lower.Contains("sentence count") || lower.Contains("how long") ||
+               lower.Contains("character count");
+    }
+
+    // ── Free client-side checks (no API needed) ──────────────────────────────
+    private async Task RunFreeCheck(string query)
+    {
+        var text = await JSRuntime.InvokeAsync<string>("getDocumentText");
+        var lower = query.ToLower();
+        string reply;
+
+        if (lower.Contains("word"))
+        {
+            var words = string.IsNullOrWhiteSpace(text) ? 0
+                : text.Split(new[] { ' ', '\n', '\r', '\t' },
+                             StringSplitOptions.RemoveEmptyEntries).Length;
+            reply = $"📊 Word count: <strong>{words:N0}</strong> words";
+        }
+        else if (lower.Contains("sentence"))
+        {
+            var sentences = string.IsNullOrWhiteSpace(text) ? 0
+                : text.Split(new[] { '.', '!', '?' },
+                             StringSplitOptions.RemoveEmptyEntries).Length;
+            reply = $"📊 Sentence count: <strong>{sentences:N0}</strong> sentences";
+        }
+        else if (lower.Contains("character"))
+        {
+            reply = $"📊 Character count: <strong>{text?.Length ?? 0:N0}</strong> characters";
+        }
+        else
+        {
+            reply = "I can answer word count, sentence count, and character count for free. For proofreading and copyediting questions, I'll use the AI engine.";
+        }
+
+        AddMessage("assistant", reply, null);
+    }
+
+    // ── Call Claude API via server ────────────────────────────────────────────
+    private async Task CallAI(string prompt, bool extractApplicable)
+    {
+        _chatLoading = true;
+        StateHasChanged();
+        await ScrollChatToBottom();
+
+        try
+        {
+            var response = await Http.PostAsJsonAsync("api/ai/chat",
+                new { Prompt = prompt });
+
+            if (!response.IsSuccessStatusCode)
+            {
+                AddMessage("assistant", $"❌ AI error: {await response.Content.ReadAsStringAsync()}", null);
+                return;
+            }
+
+            var aiText = await response.Content.ReadAsStringAsync();
+            aiText = aiText.Trim('"').Replace("\\n", "\n").Replace("\\r", "");
+
+            // Format for HTML display
+            var htmlContent = FormatAsHtml(aiText);
+
+            // For copyedit: try to extract the improved version for "Apply" button
+            string? applicable = extractApplicable ? ExtractImprovedText(aiText) : null;
+
+            AddMessage("assistant", htmlContent, applicable);
+        }
+        catch (Exception ex)
+        {
+            AddMessage("assistant", $"❌ {ex.Message}", null);
+        }
+        finally
+        {
+            _chatLoading = false;
+            StateHasChanged();
+            await ScrollChatToBottom();
+        }
+    }
+
+    // ── Apply AI suggestion back into the document ───────────────────────────
+    private async Task ApplySuggestion(string text)
+{
+    await JSRuntime.InvokeVoidAsync("replaceSelectedText", text);
+
+    SetStatus("AI suggestion applied as tracked change.", false);
+    AddMessage("assistant", "✅ Applied to document.", null);
+}
+    // ════════════════════════════════════════════════════════════════════════
+    // SEARCH & REPLACE
+    // ════════════════════════════════════════════════════════════════════════
+
+    private async Task OnSearchInput(ChangeEventArgs e)
+    {
+        _searchQuery = e.Value?.ToString() ?? string.Empty;
+        await RunSearch();
+    }
+
+    private async Task HandleSearchKeyDown(KeyboardEventArgs e)
+    {
+        if (e.Key == "Enter")
+        {
+            // Prevent Enter from reaching editor via JS
+            await JSRuntime.InvokeVoidAsync("eval",
+                "event && event.stopPropagation && event.stopPropagation();");
+            if (e.ShiftKey) await SearchPrev();
+            else            await SearchNext();
+        }
+        // RunSearch is triggered by oninput binding automatically on each keystroke
+    }
+
+    private async Task RunSearch()
+    {
+        if (string.IsNullOrWhiteSpace(_searchQuery))
+        {
+            await JSRuntime.InvokeVoidAsync("clearSearch");
+            _searchResultInfo = string.Empty;
+            return;
+        }
+        var count = await JSRuntime.InvokeAsync<int>("searchInDocument", _searchQuery);
+        _searchResultInfo = count > 0 ? $"{count} found" : "not found";
+        StateHasChanged();
+    }
+
+    private async Task SearchNext()
+    {
+        if (string.IsNullOrWhiteSpace(_searchQuery)) return;
+        await JSRuntime.InvokeVoidAsync("searchNavigate", "next");
+    }
+
+    private async Task SearchPrev()
+    {
+        if (string.IsNullOrWhiteSpace(_searchQuery)) return;
+        await JSRuntime.InvokeVoidAsync("searchNavigate", "prev");
+    }
+
+    private async Task ReplaceAll()
+    {
+        if (string.IsNullOrWhiteSpace(_searchQuery)) return;
+        var count = await JSRuntime.InvokeAsync<int>("replaceAllInDocument", _searchQuery, _replaceQuery);
+        _searchResultInfo = count > 0 ? $"Replaced {count}" : "not found";
+        StateHasChanged();
+    }
+
+    private void ToggleReplace()
+    {
+        _showReplace = !_showReplace;
+        StateHasChanged();
+    }
+
+    private async Task ClearSearch()
+    {
+        _searchQuery      = string.Empty;
+        _replaceQuery     = string.Empty;
+        _searchResultInfo = string.Empty;
+        _showReplace      = false;
+        await JSRuntime.InvokeVoidAsync("clearSearch");
+        StateHasChanged();
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    private void AddMessage(string role, string htmlContent, string? applicableText)
+    {
+        _chatMessages.Add(new ChatMessage(role, htmlContent, applicableText));
+        StateHasChanged();
+    }
+
+    private async Task ScrollChatToBottom()
+    {
+        await Task.Delay(80);
+        try
+        {
+            // Inline scroll — never fails even if documenteditor.js is cached
+            await JSRuntime.InvokeVoidAsync("eval",
+                "var el=document.getElementById('chatMessages'); if(el) el.scrollTop=el.scrollHeight;");
+        }
+        catch { /* silently ignore scroll errors */ }
+    }
+
+    private static string Truncate(string s, int max) =>
+        s.Length <= max ? s : s[..max] + "…";
+
+    // Trim text to a max word count to stay within Groq free token limits
+    private static string TrimToWordLimit(string text, int maxWords)
+    {
+        var words = text.Split(' ');
+        if (words.Length <= maxWords) return text;
+        return string.Join(' ', words[..maxWords]);
+    }
+
+    private static string FormatAsHtml(string text)
+    {
+        // Convert markdown-ish formatting to HTML
+        var html = System.Web.HttpUtility.HtmlEncode(text);
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"\*\*(.+?)\*\*", "<strong>$1</strong>");
+        html = System.Text.RegularExpressions.Regex.Replace(html, @"\*(.+?)\*", "<em>$1</em>");
+        html = html.Replace("\n", "<br/>");
+        return html;
+    }
+
+    private static string? ExtractImprovedText(string aiResponse)
+    {
+        // Look for the improved version after common patterns
+        var patterns = new[] { "improved version:", "revised version:", "copyedited version:", "here is the" };
+        foreach (var pattern in patterns)
+        {
+            var idx = aiResponse.ToLower().IndexOf(pattern);
+            if (idx >= 0)
+            {
+                var after = aiResponse[(idx + pattern.Length)..].Trim().TrimStart('\n', '\r', ':').Trim();
+                // Return first paragraph
+                var end = after.IndexOf('\n');
+                return end > 0 ? after[..end].Trim() : after.Trim();
+            }
+        }
+        return null;
+    }
+
+    private void SetStatus(string message, bool isError)
+    {
+        _statusMessage = message;
+        _statusClass   = isError ? "de-status-error" : "de-status-ok";
+        StateHasChanged();
+    }
+
+    // ── Chat message model ────────────────────────────────────────────────────
+    private record ChatMessage(string Role, string HtmlContent, string? ApplicableText);
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TAB MANAGEMENT
+    // ════════════════════════════════════════════════════════════════════════
+
+    protected override Task OnInitializedAsync()
+    {
+        // Start with one empty tab — editor not ready yet, just set up state
+        var tab = new DocTab { FileName = "Untitled.docx", IsEmpty = true };
+        _tabs.Add(tab);
+        _activeTabId = tab.Id;
+        return Task.CompletedTask;
+    }
+
+    private async Task NewTab()
+    {
+        // Save current tab's content before switching away — regardless of IsEmpty
+        var current = ActiveTab;
+        if (current != null)
+        {
+            var oldSfdt = await JSRuntime.InvokeAsync<string>("getDocumentContent");
+            if (!string.IsNullOrEmpty(oldSfdt))
+            {
+                current.Sfdt       = oldSfdt;
+                current.IsEmpty    = false;  // has content now
+                current.IsModified = true;
+            }
+        }
+
+        var tab = new DocTab { FileName = "Untitled.docx", IsEmpty = true };
+        _tabs.Add(tab);
+        _activeTabId = tab.Id;
+        await JSRuntime.InvokeVoidAsync("loadBlankDocument");
+        StateHasChanged();
+    }
+
+    private async Task SwitchTab(Guid tabId)
+    {
+        if (tabId == _activeTabId) return;
+
+        // Capture references BEFORE any await
+        var currentTab = ActiveTab;
+        var nextTab    = _tabs.FirstOrDefault(t => t.Id == tabId);
+        if (nextTab == null) return;
+
+        // Debug: log what we're about to pass to JS
+        await JSRuntime.InvokeVoidAsync("eval",
+            $"console.log('[C# SwitchTab] nextTab.IsEmpty={nextTab.IsEmpty}, nextTab.Sfdt.Length={nextTab.Sfdt?.Length ?? 0}, nextTab.FileName={nextTab.FileName}')");
+
+        // Use Sfdt if available, regardless of IsEmpty flag
+        bool nextIsBlank = string.IsNullOrEmpty(nextTab.Sfdt);
+        var oldSfdt = await JSRuntime.InvokeAsync<string>(
+            "saveAndSwitch",
+            nextIsBlank ? null : nextTab.Sfdt,
+            nextIsBlank);
+
+        // Always save current tab's content
+        if (currentTab != null && !string.IsNullOrEmpty(oldSfdt))
+        {
+            currentTab.Sfdt    = oldSfdt;
+            currentTab.IsEmpty = false;  // once content exists, it's no longer empty
+        }
+
+        _activeTabId = tabId;
+        StateHasChanged();
+    }
+
+    private async Task CloseTab(Guid tabId)
+    {
+        var tab = _tabs.FirstOrDefault(t => t.Id == tabId);
+        if (tab == null) return;
+
+        // If only one tab left, just reset it to empty instead of closing
+        if (_tabs.Count == 1)
+        {
+            tab.FileName   = "Untitled.docx";
+            tab.Sfdt       = string.Empty;
+            tab.IsModified = false;
+            tab.IsEmpty    = true;
+            await JSRuntime.InvokeVoidAsync("loadBlankDocument");
+            StateHasChanged();
+            return;
+        }
+
+        var idx = _tabs.IndexOf(tab);
+        _tabs.Remove(tab);
+
+        // Activate neighbour tab
+        var nextTab = _tabs[Math.Min(idx, _tabs.Count - 1)];
+        _activeTabId = nextTab.Id;
+
+        if (nextTab.IsEmpty)
+            await JSRuntime.InvokeVoidAsync("loadBlankDocument");
+        else
+            await JSRuntime.InvokeVoidAsync("loadDocument", nextTab.Sfdt);
+
+        StateHasChanged();
+    }
+
+    private async Task SaveCurrentTabSfdt()
+    {
+        var current = ActiveTab;
+        if (current == null || current.IsEmpty) return;
+        var sfdt = await JSRuntime.InvokeAsync<string>("getDocumentContent");
+        if (!string.IsNullOrEmpty(sfdt))
+        {
+            current.Sfdt       = sfdt;
+            current.IsModified = true;
+        }
+    }
+
+    // ── DocTab model ──────────────────────────────────────────────────────────
+    private class DocTab
+    {
+        public Guid   Id          { get; } = Guid.NewGuid();
+        public string FileName    { get; set; } = "Untitled.docx";
+        public string Sfdt        { get; set; } = string.Empty;
+        public bool   IsModified  { get; set; } = false;
+        public bool   IsEmpty     { get; set; } = false;
+        public string DisplayName => FileName.Length > 18
+            ? FileName[..15] + "…"
+            : FileName;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // TRACK CHANGES
+    // ════════════════════════════════════════════════════════════════════════
+
+    private async Task ToggleTrackChanges()
+    {
+        var enabled = await JSRuntime.InvokeAsync<bool>("toggleTrackChanges");
+        SetStatus(enabled ? "✍ Track Changes ON" : "✍ Track Changes OFF", false);
+    }
+
+    private async Task AcceptAllChanges()
+    {
+        await JSRuntime.InvokeVoidAsync("acceptAllChanges");
+        SetStatus("✔ All changes accepted.", false);
+    }
+
+    private async Task RejectAllChanges()
+    {
+        await JSRuntime.InvokeVoidAsync("rejectAllChanges");
+        SetStatus("✖ All changes rejected.", false);
+    }
+
+    private async Task PreviewSuggestion(ChatMessage msg)
+{
+    var original = await JSRuntime.InvokeAsync<string>("getSelectedText");
+
+    if (string.IsNullOrWhiteSpace(original))
+    {
+        SetStatus("⚠️ Select text to preview changes.", true);
+        return;
+    }
+
+    var previewHtml = $@"
+        <div style='margin-bottom:8px;'>
+            <strong>Original:</strong><br/>
+            <span style='color:#fca5a5'>{System.Web.HttpUtility.HtmlEncode(original)}</span>
+        </div>
+        <div style='margin-bottom:8px;'>
+            <strong>AI Suggestion:</strong><br/>
+            <span style='color:#86efac'>{System.Web.HttpUtility.HtmlEncode(msg.ApplicableText!)}</span>
+        </div>
+        <div style='font-size:0.75rem;color:#64748b;'>
+            Click <strong>Apply</strong> below to insert as tracked change.
+        </div>
+    ";
+
+    // 👇 IMPORTANT: pass ApplicableText so Apply button appears
+    AddMessage("assistant", previewHtml, msg.ApplicableText);
+
+    await ScrollChatToBottom();
+}
+}
